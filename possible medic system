@@ -1,0 +1,602 @@
+
+
+use.ai: ``lua
+--[[
+    QBCore NPC Medic System
+    Spawns an NPC medic when the player is downed and requests help.
+    The medic loads the player into an ambulance, drives to the hospital, and respawns the player at a bed.
+]]
+
+local QBCore = exports['qb-core']:GetCoreObject()
+
+-- ============================================
+-- CONFIGURATION
+-- ============================================
+
+local Config = {
+    -- Hospital destination coordinates (INSERT YOUR COORDS HERE)
+    HospitalCoords = vector4(311.81, -590.52, 43.29, 70.0), -- Pillbox Hill Medical Center entrance
+    
+    -- Hospital bed spawn point (where player respawns after arrival)
+    HospitalBedCoords = vector4(307.29, -595.78, 43.29, 70.0), -- INSERT YOUR BED COORDS HERE
+    
+    -- Medic ped model
+    MedicModel = 'smmparamedic01',
+    
+    -- Ambulance vehicle model
+    AmbulanceModel = 'ambulance',
+    
+    -- Spawn distance from player
+    SpawnDistance = 50.0,
+    
+    -- Drive speed
+    DriveSpeed = 25.0,
+    
+    -- Driving style (normal, safe driving)
+    DrivingStyle = 786603,
+    
+    -- Time before medic despawns after dropping off player (ms)
+    DespawnDelay = 10000,
+    
+    -- Keybind to request medic (while downed)
+    RequestKey = 47, -- G key
+    
+    -- Cooldown between requests (seconds)
+    RequestCooldown = 60,
+}
+
+-- ============================================
+-- LOCAL VARIABLES
+-- ============================================
+
+local medicPed = nil
+local ambulanceVehicle = nil
+local isRequestingMedic = false
+local medicEnRoute = false
+local lastRequestTime = 0
+
+-- ============================================
+-- UTILITY FUNCTIONS
+-- ============================================
+
+local function LoadModel(model)
+    local hash = type(model) == 'string' and GetHashKey(model) or model
+    if not IsModelValid(hash) then
+        print('[NPC Medic] Invalid model: ' .. tostring(model))
+        return false
+    end
+    
+    RequestModel(hash)
+    local timeout = 0
+    while not HasModelLoaded(hash) and timeout < 100 do
+        Wait(100)
+        timeout = timeout + 1
+    end
+    
+    return HasModelLoaded(hash)
+end
+
+local function LoadAnimDict(dict)
+    RequestAnimDict(dict)
+    local timeout = 0
+    while not HasAnimDictLoaded(dict) and timeout < 100 do
+        Wait(100)
+        timeout = timeout + 1
+    end
+    return HasAnimDictLoaded(dict)
+end
+
+local function GetSpawnPointNearPlayer()
+    local playerCoords = GetEntityCoords(PlayerPedId())
+    local foundSpawn = false
+    local spawnCoords = playerCoords
+    
+    -- Try to find a suitable road position
+    local nodeFound, nodeCoords = GetClosestVehicleNode(
+        playerCoords.x, 
+        playerCoords.y, 
+        playerCoords.z, 
+        1, 
+        3.0, 
+        0
+    )
+    
+    if nodeFound then
+        -- Offset to spawn from a distance
+        local heading = GetHeadingFromVector2d(
+            playerCoords.x - nodeCoords.x,
+            playerCoords.y - nodeCoords.y
+        )
+        
+        local spawnOffset = Config.SpawnDistance
+        spawnCoords = vector3(
+            nodeCoords.x - spawnOffset  math.cos(math.rad(heading)),
+            nodeCoords.y - spawnOffset  math.sin(math.rad(heading)),
+            nodeCoords.z
+        )
+        
+        -- Get road position for spawn
+        local roadFound, roadCoords = GetClosestVehicleNode(
+            spawnCoords.x,
+            spawnCoords.y,
+            spawnCoords.z,
+            1,
+            3.0,
+            0
+        )
+        
+        if roadFound then
+            spawnCoords = roadCoords
+            foundSpawn = true
+        end
+    end
+    
+    return spawnCoords, foundSpawn
+end
+
+-- ============================================
+-- CORE FUNCTIONS
+-- ============================================
+
+local function CleanupMedic()
+    if medicPed and DoesEntityExist(medicPed) then
+        DeleteEntity(medicPed)
+        medicPed = nil
+    end
+    
+    if ambulanceVehicle and DoesEntityExist(ambulanceVehicle) then
+        DeleteEntity(ambulanceVehicle)
+        ambulanceVehicle = nil
+    end
+    
+    medicEnRoute = false
+    isRequestingMedic = false
+end
+
+local function SpawnAmbulanceAndMedic(spawnCoords)
+    local playerPed = PlayerPedId()
+    local playerCoords = GetEntityCoords(playerPed)
+    
+    -- Load models
+    if not LoadModel(Config.AmbulanceModel) then
+        QBCore.Functions.Notify('Failed to load ambulance model', 'error')
+        return false
+    end
+    
+    if not LoadModel(Config.MedicModel) then
+        QBCore.Functions.Notify('Failed to load medic model', 'error')
+        return false
+    end
+    
+    -- Calculate heading towards player
+    local heading = GetHeadingFromVector2d(
+        playerCoords.x - spawnCoords.x,
+        playerCoords.y - spawnCoords.y
+    )
+    
+    -- Spawn ambulance
+    ambulanceVehicle = CreateVehicle(
+        GetHashKey(Config.AmbulanceModel),
+        spawnCoords.x,
+        spawnCoords.y,
+        spawnCoords.z,
+        heading,
+        true,
+        false
+    )
+    
+    if not DoesEntityExist(ambulanceVehicle) then
+        QBCore.Functions.Notify('Failed to spawn ambulance', 'error')
+        return false
+    end
+    
+    SetEntityAsMissionEntity(ambulanceVehicle, true, true)
+    SetVehicleEngineOn(ambulanceVehicle, true, true, false)
+    SetVehicleSiren(ambulanceVehicle, true)
+    
+    -- Spawn medic in driver seat
+    medicPed = CreatePedInsideVehicle(
+        ambulanceVehicle,
+        4, -- PEDTYPECIVMALE
+        GetHashKey(Config.MedicModel),
+        -1, -- Driver seat
+        true,
+        false
+    )
+    
+    if not DoesEntityExist(medicPed) then
+        QBCore.Functions.Notify('Failed to spawn medic', 'error')
+        DeleteEntity(ambulanceVehicle)
+        return false
+    end
+    
+    SetEntityAsMissionEntity(medicPed, true, true)
+    SetBlockingOfNonTemporaryEvents(medicPed, true)
+    SetPedKeepTask(medicPed, true)
+    
+    -- Clean up models
+    SetModelAsNoLongerNeeded(GetHashKey(Config.AmbulanceModel))
+    SetModelAsNoLongerNeeded(GetHashKey(Config.MedicModel))
+    
+    return true
+end
+
+local function DriveToPlayer()
+    local playerPed = PlayerPedId()
+    local playerCoords = GetEntityCoords(playerPed)
+    
+    -- Drive to player
+    TaskVehicleDriveToCoordLongrange(
+        medicPed,
+        ambulanceVehicle,
+        playerCoords.x,
+        playerCoords.y,
+        playerCoords.z,
+        Config.DriveSpeed,
+        Config.DrivingStyle,
+        10.0
+    )
+    
+    -- Wait until close to player
+    while medicEnRoute do
+        Wait(1000)
+        
+        if not DoesEntityExist(medicPed) or not DoesEntityExist(ambulanceVehicle) then
+            CleanupMedic()
+            return false
+        end
+        
+        local medicCoords = GetEntityCoords(medicPed)
+        playerCoords = GetEntityCoords(playerPed)
+        local distance = #(medicCoords - playerCoords)
+        
+        if distance < 15.0 then
+            break
+        end
+        
+        -- Update destination if player moved
+        TaskVehicleDriveToCoordLongrange(
+            medicPed,
+            ambulanceVehicle,
+            playerCoords.x,
+            playerCoords.y,
+            playerCoords.z,
+            Config.DriveSpeed,
+            Config.DrivingStyle,
+            10.0
+        )
+    end
+    
+    -- Stop the vehicle
+    TaskVehicleTempAction(medicPed, ambulanceVehicle, 1, 2000)
+    Wait(2000)
+    
+    return true
+end
+
+local function LoadPlayerIntoAmbulance()
+    local playerPed = PlayerPedId()
+    
+    -- Medic exits vehicle
+    TaskLeaveVehicle(medicPed, ambulanceVehicle, 0)
+    Wait(2000)
+    
+    -- Walk to player
+    local playerCoords = GetEntityCoords(playerPed)
+    TaskGoToCoordAnyMeans(medicPed, playerCoords.x, playerCoords.y, playerCoords.z, 1.0, 0, false, 786603, 0.0)
+    
+    -- Wait for medic to reach player
+    local timeout = 0
+    while timeout < 30 do
+        Wait(1000)
+        timeout = timeout + 1
+        
+        local medicCoords = GetEntityCoords(medicPed)
+        local distance = #(medicCoords - playerCoords)
+        
+        if distance < 2.0 then
+            break
+        end
+    end
+    
+    -- Play revive animation
+    if LoadAnimDict('mini@cpr@chara@cprstr') then
+        TaskPlayAnim(medicPed, 'mini@cpr@chara@cprstr', 'cprpumpchest', 8.0, -8.0, 3000, 0, 0, false, false, false)
+        Wait(3000)
+        ClearPedTasks(medicPed)
+    end
+    
+    QBCore.Functions.Notify('Medic: "Let\'s get you to the hospital."', 'primary')
+    
+    -- Warp player into back of ambulance
+    SetPedIntoVehicle(playerPed, ambulanceVehicle, 2) -- Back left seat
+    
+    -- Medic gets back in
+    TaskEnterVehicle(medicPed, ambulanceVehicle, 5000, -1, 2.0, 1, 0)
+    Wait(5000)
+    
+    if not IsPedInVehicle(medicPed, ambulanceVehicle, false) then
+        SetPedIntoVehicle(medicPed, ambulanceVehicle, -1)
+    end
+    
+    return true
+end
+
+local function DriveToHospital()
+    local playerPed = PlayerPedId()
+    local hospitalCoords = Config.HospitalCoords
+    
+    QBCore.Functions.Notify('Medic: "En route to Pillbox Medical."', 'primary')
+    
+    -- Set GPS blip
+    SetNewWaypoint(hospitalCoords.x, hospitalCoords.y)
+    
+    -- Drive to hospital
+    TaskVehicleDriveToCoordLongrange(
+        medicPed,
+        ambulanceVehicle,
+        hospitalCoords.x,
+        hospitalCoords.y,
+        hospitalCoords.z,
+        Config.DriveSpeed,
+        Config.DrivingStyle,
+        5.0
+    )
+    
+    -- Wait until at hospital
+    while medicEnRoute do
+        Wait(1000)
+        
+        if not DoesEntityExist(medicPed) or not DoesEntityExist(ambulanceVehicle) then
+            -- Emergency respawn if something breaks
+            SetEntityCoords(playerPed, Config.HospitalBedCoords.x, Config.HospitalBedCoords.y, Config.HospitalBedCoords.z, false, false, false, true)
+            CleanupMedic()
+            return false
+        end
+        
+        local vehicleCoords = GetEntityCoords(ambulanceVehicle)
+        local distance = #(vehicleCoords - vector3(hospitalCoords.x, hospitalCoords.y, hospitalCoords.z))
+        
+        if distance < 20.0 then
+            break
+        end
+    end
+    
+    -- Stop at hospital
+    TaskVehicleTempAction(medicPed, ambulanceVehicle, 1, 3000)
+    Wait(3000)
+    
+    return true
+end
+
+local function RespawnPlayerAtHospital()
+    local playerPed = PlayerPedId()
+    local bedCoords = Config.HospitalBedCoords
+    
+    -- Remove player from vehicle
+    TaskLeaveVehicle(playerPed, ambulanceVehicle, 0)
+    Wait(2000)
+    
+    -- Fade out
+    DoScreenFadeOut(1000)
+    Wait(1000)
+    
+    -- Teleport to bed
+    SetEntityCoords(playerPed, bedCoords.x, bedCoords.y, bedCoords.z, false, false, false, true)
+    SetEntityHeading(playerPed, bedCoords.w)
+    
+    -- Revive player (trigger your revival system)
+    TriggerEvent('hospital:client:Revive')
+    -- Alternative events depending on your setup:
+    -- TriggerEvent('esxambulancejob:revive')
+    -- TriggerServerEvent('QBCore:Server:SetMetaData', 'isdead', false)
+    
+    Wait(500)
+    
+    -- Fade back in
+    DoScreenFadeIn(1000)
+    
+    QBCore.Functions.Notify('You have been treated at Pillbox Medical Center', 'success')
+    
+    -- Cleanup after delay
+    SetTimeout(Config.DespawnDelay, function()
+        CleanupMedic()
+    end)
+end
+
+local function RequestMedicService()
+    if isRequestingMedic or medicEnRoute then
+        QBCore.Functions.Notify('Medical assistance already requested', 'error')
+        return
+    end
+    
+    local currentTime = GetGameTimer()
+    if currentTime - lastRequestTime < Config.RequestCooldown  1000 then
+        local remaining = math.ceil((Config.RequestCooldown  1000 - (currentTime - lastRequestTime)) / 1000)
+        QBCore.Functions.Notify('Please wait ' .. remaining .. ' seconds before requesting again', 'error')
+        return
+    end
+    
+    lastRequestTime = currentTime
+    isRequestingMedic = true
+    medicEnRoute = true
+    
+    QBCore.Functions.Notify('Requesting medical assistance...', 'primary')
+    
+    -- Get spawn point
+    local spawnCoords, foundSpawn = GetSpawnPointNearPlayer()
+    
+    if not foundSpawn then
+        QBCore.Functions.Notify('Could not find suitable spawn point for ambulance', 'error')
+        isRequestingMedic = false
+        medicEnRoute = false
+        return
+    end
+    
+    -- Spawn ambulance and medic
+    if not SpawnAmbulanceAndMedic(spawnCoords) then
+        isRequestingMedic = false
+        medicEnRoute = false
+        return
+    end
+    
+    QBCore.Functions.Notify('Medic dispatched! ETA 1-2 minutes', 'success')
+    
+    -- Create blip for ambulance
+    local blip = AddBlipForEntity(ambulanceVehicle)
+    SetBlipSprite(blip, 61)
+    SetBlipColour(blip, 1)
+    SetBlipScale(blip, 0.8)
+    SetBlipAsShortRange(blip, false)
+    BeginTextCommandSetBlipName("STRING")
+    AddTextComponentString("NPC Medic")
+    EndTextCommandSetBlipName(blip)
+    
+    -- Drive to player
+    if not DriveToPlayer() then
+        if DoesBlipExist(blip) then RemoveBlip(blip) end
+        return
+    end
+    
+    -- Load player into ambulance
+    if not LoadPlayerIntoAmbulance() then
+        if DoesBlipExist(blip) then RemoveBlip(blip) end
+        CleanupMedic()
+        return
+    end
+    
+    -- Drive to hospital
+    if not DriveToHospital() then
+        if DoesBlipExist(blip) then RemoveBlip(blip) end
+        return
+    end
+    
+    -- Respawn at hospital bed
+    RespawnPlayerAtHospital()
+    
+    -- Remove blip
+    if DoesBlipExist(blip) then
+        RemoveBlip(blip)
+    end
+end
+
+-- ============================================
+-- MAIN THREAD
+-- ============================================
+
+CreateThread(function()
+    while true do
+        Wait(0)
+        
+        local playerPed = PlayerPedId()
+        local isDead = IsEntityDead(playerPed) or QBCore.Functions.GetPlayerData().metadata['inlaststand'] or QBCore.Functions.GetPlayerData().metadata['isdead']
+        
+        if isDead and not medicEnRoute then
+            -- Show help text
+            BeginTextCommandDisplayHelp("STRING")
+            AddTextComponentSubstringPlayerName("Press ~INPUTDETONATE~ to request NPC Medic")
+            EndTextCommandDisplayHelp(0, false, true, -1)
+            
+            -- Check for key press
+            if IsControlJustPressed(0, Config.RequestKey) then
+                RequestMedicService()
+            end
+        else
+            Wait(500)
+        end
+    end
+end)
+
+-- ============================================
+-- COMMANDS & EXPORTS
+-- ============================================
+
+-- Command to request medic (alternative to keybind)
+RegisterCommand('requestmedic', function()
+    local playerPed = PlayerPedId()
+    local isDead = IsEntityDead(playerPed) or QBCore.Functions.GetPlayerData().metadata['inlaststand'] or QBCore.Functions.GetPlayerData().metadata['isdead']
+    
+    if isDead then
+        RequestMedicService()
+    else
+        QBCore.Functions.Notify('You must be downed to request a medic', 'error')
+    end
+end, false)
+
+-- Command to cancel medic request
+RegisterCommand('cancelmedic', function()
+    if medicEnRoute then
+        CleanupMedic()
+        QBCore.Functions.Notify('Medic request cancelled', 'primary')
+    else
+        QBCore.Functions.Notify('No medic currently en route', 'error')
+    end
+end, false)
+
+-- Export for other scripts
+exports('RequestNPCMedic', RequestMedicService)
+exports('CancelNPCMedic', CleanupMedic)
+exports('IsMedicEnRoute', function() return medicEnRoute end)
+
+-- ============================================
+-- CLEANUP ON RESOURCE STOP
+-- ============================================
+
+AddEventHandler('onResourceStop', function(resourceName)
+    if GetCurrentResourceName() == resourceName then
+        CleanupMedic()
+    end
+end)
+
+-- Player death cleanup
+AddEventHandler('QBCore:Client:OnPlayerLoaded', function()
+    CleanupMedic()
+end)
+
+print('[NPC Medic] Resource loaded successfully')
+`
+
+Setup Instructions
+Create the resource folder: resources/[qb]/qb-npcmedic/
+
+Create fxmanifest.lua:
+
+`lua
+fxversion 'cerulean'
+game 'gta5'
+
+description 'QBCore NPC Medic System'
+author 'Your Name'
+version '1.0.0'
+
+clientscript 'client.lua'
+
+dependency 'qb-core'
+`
+
+Configure your coordinates in the Config table at the top of the script:
+   - HospitalCoords — Where the ambulance drives to
+   - HospitalBedCoords — Where the player spawns after arrival
+
+Add to your server.cfg:
+`
+ensure qb-npcmedic
+`
+
+Features
+
+| Feature | Description |
+|---------|-------------|
+| Keybind activation | Press G while downed to request a medic |
+| Command fallback | /requestmedic and /cancelmedic |
+| Sirens enabled | Ambulance drives with lights and sirens |
+| Blip tracking | See the ambulance on your map |
+| Animations | Medic performs CPR before loading you |
+| Auto-cleanup | Resources despawn after delivery |
+| Cooldown system | Prevents spam requests |
+| Exports | Integrate with other scripts |
+
+Customization Tips
+• Adjust DriveSpeed if the ambulance is too slow/fast
+• Change MedicModel to use a different ped (e.g., sfyscrubs_01 for a female nurse)
+• Modify the hospital revival event to match your death/respawn system (the script triggers hospital:client:Revive` by default)
